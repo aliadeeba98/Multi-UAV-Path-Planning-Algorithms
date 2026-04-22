@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import random
 from collections import defaultdict
@@ -217,13 +218,13 @@ def run_experiments(maps):
 
             print(f"Test -> Steps: {avg_steps:.2f}, Collisions: {collision_freq:.2f}, Success: {success_rate:.2f}")
 
-    # Convert to DataFrame
+    out_dir = "results"
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "q_learning_results.csv")
     df = pd.DataFrame(results)
+    df.to_csv(out_path, index=False)
 
-    # Save CSV
-    df.to_csv("q_learning_results.csv", index=False)
-
-    print("\nResults saved to q_learning_results.csv")
+    print(f"\nResults saved to {out_path}")
 
     return results
 

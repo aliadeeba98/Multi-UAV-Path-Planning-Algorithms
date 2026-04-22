@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import heapq
 import pandas as pd
@@ -168,10 +169,13 @@ def run_experiments(maps):
 
             print(f"Steps: {avg_steps:.2f}, Collisions: {collision_freq:.2f}, Success: {success_rate:.2f}")
 
+    out_dir = "results"
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "dstar_results.csv")
     df = pd.DataFrame(results)
-    df.to_csv("dstar_results.csv", index=False)
+    df.to_csv(out_path, index=False)
 
-    print("\nResults saved to dstar_results.csv")
+    print(f"\nResults saved to {out_path}")
     return results
 
 

@@ -1,0 +1,4 @@
+=== DQN finished at 2026-04-22T15:11:40+02:00 ===
+=== SAC_NewMaps.py ===
+/root/custody-deploy/Multi-UAV-Path-Planning-Algorithms/SAC_NewMaps.py:156: UserWarning: Creating a tensor from a list of numpy.ndarrays is extremely slow. Please consider converting the list to a single numpy.ndarray with numpy.array() before converting to a tensor. (Triggered internally at /pytorch/torch/csrc/utils/tensor_new.cpp:253.)
+  s = torch.FloatTensor(s)

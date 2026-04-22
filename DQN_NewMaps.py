@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import random
 import pandas as pd
@@ -5,6 +6,11 @@ from collections import deque
 import torch
 import torch.nn as nn
 import torch.optim as optim
+
+# Set QUICK_EXPERIMENT=1 for shorter training so results CSVs finish in much less time (same schema).
+_QUICK = os.environ.get("QUICK_EXPERIMENT", "").lower() in ("1", "true", "yes")
+TRAIN_EPISODES = 40 if _QUICK else 5000
+TEST_EPISODES = 20 if _QUICK else 1000
 
 # ==============================
 # ENVIRONMENT (UNCHANGED)
@@ -250,8 +256,8 @@ def run_experiments(maps):
             env = MultiUAVEnv(grid, num_agents)
             agents = [DQNAgent(state_dim=2, action_dim=5) for _ in range(num_agents)]
 
-            train(env, agents)
-            avg_steps, collision_freq, success_rate = test(env, agents)
+            train(env, agents, episodes=TRAIN_EPISODES)
+            avg_steps, collision_freq, success_rate = test(env, agents, episodes=TEST_EPISODES)
 
             results.append({
                 "Map": idx+1,
@@ -263,9 +269,12 @@ def run_experiments(maps):
 
             print(f"Test -> Steps: {avg_steps:.2f}, Collisions: {collision_freq:.2f}, Success: {success_rate:.2f}")
 
+    out_dir = "results"
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "dqn_results.csv")
     df = pd.DataFrame(results)
-    df.to_csv("dqn_results.csv", index=False)
-    print("\nResults saved to dqn_results.csv")
+    df.to_csv(out_path, index=False)
+    print(f"\nResults saved to {out_path}")
 
     return results
 
