@@ -7,10 +7,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-# Set QUICK_EXPERIMENT=1 for shorter training so results CSVs finish in much less time (same schema).
+# Set QUICK_EXPERIMENT=1 for shorter training (same CSV schema; full runs are more accurate).
 _QUICK = os.environ.get("QUICK_EXPERIMENT", "").lower() in ("1", "true", "yes")
-TRAIN_EPISODES = 40 if _QUICK else 5000
-TEST_EPISODES = 20 if _QUICK else 1000
+TRAIN_EPISODES = 400 if _QUICK else 8000
+TEST_EPISODES = 100 if _QUICK else 1500
 
 # ==============================
 # ENVIRONMENT (UNCHANGED)
@@ -47,33 +47,42 @@ class MultiUAVEnv:
 
     def step(self, actions):
         new_positions = []
-        rewards = [0] * self.num_agents
+        rewards = [0.0] * self.num_agents
         done = [False] * self.num_agents
         collision_count = 0
 
         for i, action in enumerate(actions):
             dx, dy = ACTION_MAP[action]
             x, y = self.positions[i]
+            g = self.goal_positions[i]
+            d_old = abs(x - g[0]) + abs(y - g[1])
             new_pos = (x + dx, y + dy)
 
             if not self.is_valid(new_pos):
-                rewards[i] -= 100
+                rewards[i] -= 8.0
                 new_pos = self.positions[i]
             else:
-                rewards[i] -= 1
+                rewards[i] -= 0.2
+
+            d_new = abs(new_pos[0] - g[0]) + abs(new_pos[1] - g[1])
+            rewards[i] += 0.9 * (d_old - d_new)
 
             new_positions.append(new_pos)
 
         for i in range(self.num_agents):
             for j in range(i + 1, self.num_agents):
                 if new_positions[i] == new_positions[j]:
-                    rewards[i] -= 50
-                    rewards[j] -= 50
+                    rewards[i] -= 30.0
+                    rewards[j] -= 30.0
+                    collision_count += 1
+                if new_positions[i] == self.positions[j] and new_positions[j] == self.positions[i]:
+                    rewards[i] -= 20.0
+                    rewards[j] -= 20.0
                     collision_count += 1
 
         for i in range(self.num_agents):
             if new_positions[i] == self.goal_positions[i]:
-                rewards[i] += 100
+                rewards[i] += 120.0
                 done[i] = True
 
         self.positions = new_positions
@@ -88,11 +97,11 @@ class DQN(nn.Module):
     def __init__(self, state_dim, action_dim):
         super(DQN, self).__init__()
         self.net = nn.Sequential(
-            nn.Linear(state_dim, 64),
+            nn.Linear(state_dim, 128),
             nn.ReLU(),
-            nn.Linear(64, 64),
+            nn.Linear(128, 128),
             nn.ReLU(),
-            nn.Linear(64, action_dim)
+            nn.Linear(128, action_dim)
         )
 
     def forward(self, x):
@@ -110,25 +119,32 @@ class DQNAgent:
 
         self.model = DQN(state_dim, action_dim)
         self.target_model = DQN(state_dim, action_dim)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        self.target_model.load_state_dict(self.model.state_dict())
+        self.optimizer = optim.Adam(self.model.parameters(), lr=2e-4)
 
-        self.memory = deque(maxlen=5000)
-        self.gamma = 0.95
+        self.memory = deque(maxlen=20000)
+        self.gamma = 0.99
         self.epsilon = 1.0
-        self.epsilon_decay = 0.995
-        self.epsilon_min = 0.05
+        self.epsilon_decay = 0.9985
+        self.epsilon_min = 0.03
         self.batch_size = 64
+        self.tau = 0.005
 
-    def get_state(self, pos):
-        return np.array(pos, dtype=np.float32)
+    def get_state(self, pos, goal, n):
+        x, y = pos
+        gx, gy = goal
+        return np.array(
+            [x / n, y / n, (gx - x) / n, (gy - y) / n],
+            dtype=np.float32
+        )
 
     def choose_action(self, state):
         if random.random() < self.epsilon:
             return random.choice(ACTIONS)
 
-        state = torch.FloatTensor(state)
-        q_values = self.model(state)
-        return torch.argmax(q_values).item()
+        with torch.no_grad():
+            q_values = self.model(torch.as_tensor(state, dtype=torch.float32))
+        return int(torch.argmax(q_values).item())
 
     def store(self, s, a, r, s_next, done):
         self.memory.append((s, a, r, s_next, done))
@@ -138,31 +154,29 @@ class DQNAgent:
             return
 
         batch = random.sample(self.memory, self.batch_size)
-
         states, actions, rewards, next_states, dones = zip(*batch)
 
-        states = torch.FloatTensor(states)
-        next_states = torch.FloatTensor(next_states)
-        actions = torch.LongTensor(actions)
-        rewards = torch.FloatTensor(rewards)
-        dones = torch.FloatTensor(dones)
+        states = torch.as_tensor(np.stack(states), dtype=torch.float32)
+        next_states = torch.as_tensor(np.stack(next_states), dtype=torch.float32)
+        actions = torch.tensor(actions, dtype=torch.long)
+        rewards = torch.tensor(rewards, dtype=torch.float32)
+        dones = torch.tensor(dones, dtype=torch.float32)
 
-        q_values = self.model(states)
-        next_q_values = self.target_model(next_states)
+        with torch.no_grad():
+            next_max = self.target_model(next_states).max(dim=1).values
+            targets = rewards + (1.0 - dones) * self.gamma * next_max
 
-        target = q_values.clone()
-
-        for i in range(self.batch_size):
-            target[i][actions[i]] = rewards[i] + (1 - dones[i]) * self.gamma * torch.max(next_q_values[i])
-
-        loss = nn.MSELoss()(q_values, target.detach())
+        q_a = self.model(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        loss = nn.functional.mse_loss(q_a, targets)
 
         self.optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
         self.optimizer.step()
 
-    def update_target(self):
-        self.target_model.load_state_dict(self.model.state_dict())
+        with torch.no_grad():
+            for p, t in zip(self.model.parameters(), self.target_model.parameters()):
+                t.data.mul_(1.0 - self.tau).add_(p.data, alpha=self.tau)
 
     def decay_epsilon(self):
         self.epsilon = max(self.epsilon * self.epsilon_decay, self.epsilon_min)
@@ -174,8 +188,10 @@ class DQNAgent:
 
 def train(env, agents, episodes=5000, max_steps=200):
     for ep in range(episodes):
-        states = env.reset()
-        states = [agents[i].get_state(states[i]) for i in range(env.num_agents)]
+        pos = env.reset()
+        states = [
+            agents[i].get_state(pos[i], env.goal_positions[i], env.n) for i in range(env.num_agents)
+        ]
 
         episode_steps = 0
         episode_collisions = 0
@@ -183,11 +199,15 @@ def train(env, agents, episodes=5000, max_steps=200):
         for step in range(max_steps):
             actions = [agents[i].choose_action(states[i]) for i in range(env.num_agents)]
 
-            next_states, rewards, done, collisions = env.step(actions)
-            next_states = [agents[i].get_state(next_states[i]) for i in range(env.num_agents)]
+            next_pos, rewards, done, collisions = env.step(actions)
+            next_states = [
+                agents[i].get_state(next_pos[i], env.goal_positions[i], env.n) for i in range(env.num_agents)
+            ]
 
             for i in range(env.num_agents):
-                agents[i].store(states[i], actions[i], rewards[i], next_states[i], done[i])
+                agents[i].store(
+                    states[i], actions[i], rewards[i], next_states[i], float(done[i])
+                )
                 agents[i].train_step()
 
             states = next_states
@@ -202,7 +222,6 @@ def train(env, agents, episodes=5000, max_steps=200):
 
         for agent in agents:
             agent.decay_epsilon()
-            agent.update_target()
 
 
 # ==============================
@@ -216,12 +235,15 @@ def test(env, agents, episodes=1000, max_steps=200):
         agent.epsilon = 0
 
     for _ in range(episodes):
-        states = env.reset()
+        pos = env.reset()
         steps, episode_collisions = 0, 0
 
         for _ in range(max_steps):
-            actions = [agent.choose_action(agent.get_state(states[i])) for i, agent in enumerate(agents)]
-            states, _, done, collisions = env.step(actions)
+            actions = [
+                agent.choose_action(agent.get_state(pos[i], env.goal_positions[i], env.n))
+                for i, agent in enumerate(agents)
+            ]
+            pos, _, done, collisions = env.step(actions)
 
             steps += 1
             episode_collisions += collisions
@@ -254,7 +276,7 @@ def run_experiments(maps):
             print(f"Agents: {num_agents}")
 
             env = MultiUAVEnv(grid, num_agents)
-            agents = [DQNAgent(state_dim=2, action_dim=5) for _ in range(num_agents)]
+            agents = [DQNAgent(state_dim=4, action_dim=5) for _ in range(num_agents)]
 
             train(env, agents, episodes=TRAIN_EPISODES)
             avg_steps, collision_freq, success_rate = test(env, agents, episodes=TEST_EPISODES)
