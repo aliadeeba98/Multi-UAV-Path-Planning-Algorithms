@@ -4,6 +4,10 @@ import random
 from collections import defaultdict
 import pandas as pd
 
+_QUICK = os.environ.get("QUICK_EXPERIMENT", "").lower() in ("1", "true", "yes")
+TRAIN_EPISODES = 400 if _QUICK else 8000
+TEST_EPISODES = 100 if _QUICK else 1500
+
 # ==============================
 # ENVIRONMENT SETUP
 # ==============================
@@ -40,42 +44,42 @@ class MultiUAVEnv:
 
     def step(self, actions):
         new_positions = []
-        rewards = [0] * self.num_agents
+        rewards = [0.0] * self.num_agents
         done = [False] * self.num_agents
         collision_count = 0
 
-        # Move agents
         for i, action in enumerate(actions):
             dx, dy = ACTION_MAP[action]
             x, y = self.positions[i]
+            g = self.goal_positions[i]
+            d_old = abs(x - g[0]) + abs(y - g[1])
             new_pos = (x + dx, y + dy)
 
             if not self.is_valid(new_pos):
-                rewards[i] -= 100
+                rewards[i] -= 8.0
                 new_pos = self.positions[i]
             else:
-                rewards[i] -= 1
+                rewards[i] -= 0.2
 
+            d_new = abs(new_pos[0] - g[0]) + abs(new_pos[1] - g[1])
+            rewards[i] += 0.9 * (d_old - d_new)
             new_positions.append(new_pos)
 
-        # Check inter-agent collisions
         for i in range(self.num_agents):
             for j in range(i + 1, self.num_agents):
                 if new_positions[i] == new_positions[j]:
-                    rewards[i] -= 50
-                    rewards[j] -= 50
+                    rewards[i] -= 30.0
+                    rewards[j] -= 30.0
                     collision_count += 1
 
-                # swap collision
                 if new_positions[i] == self.positions[j] and new_positions[j] == self.positions[i]:
-                    rewards[i] -= 50
-                    rewards[j] -= 50
+                    rewards[i] -= 20.0
+                    rewards[j] -= 20.0
                     collision_count += 1
 
-        # Goal check
         for i in range(self.num_agents):
             if new_positions[i] == self.goal_positions[i]:
-                rewards[i] += 100
+                rewards[i] += 120.0
                 done[i] = True
 
         self.positions = new_positions
@@ -89,14 +93,14 @@ class MultiUAVEnv:
 class QAgent:
     def __init__(self, n_actions):
         self.q_table = defaultdict(lambda: np.zeros(n_actions))
-        self.alpha = 0.1
-        self.gamma = 0.95
+        self.alpha = 0.2
+        self.gamma = 0.99
         self.epsilon = 1.0
-        self.epsilon_decay = 0.999
-        self.epsilon_min = 0.05
+        self.epsilon_decay = 0.9985
+        self.epsilon_min = 0.03
 
-    def get_state(self, pos):
-        return tuple(pos)
+    def get_state(self, pos, goal):
+        return (int(pos[0]), int(pos[1]), int(goal[0]), int(goal[1]))
 
     def choose_action(self, state):
         if random.random() < self.epsilon:
@@ -119,8 +123,10 @@ class QAgent:
 
 def train(env, agents, episodes=5000, max_steps=200):
     for ep in range(episodes):
-        states = env.reset()
-        states = [agents[i].get_state(states[i]) for i in range(env.num_agents)]
+        pos = env.reset()
+        states = [
+            agents[i].get_state(pos[i], env.goal_positions[i]) for i in range(env.num_agents)
+        ]
 
         episode_steps = 0
         episode_collisions = 0
@@ -128,8 +134,10 @@ def train(env, agents, episodes=5000, max_steps=200):
         for step in range(max_steps):
             actions = [agents[i].choose_action(states[i]) for i in range(env.num_agents)]
 
-            next_states, rewards, done, collisions = env.step(actions)
-            next_states = [agents[i].get_state(next_states[i]) for i in range(env.num_agents)]
+            next_pos, rewards, done, collisions = env.step(actions)
+            next_states = [
+                agents[i].get_state(next_pos[i], env.goal_positions[i]) for i in range(env.num_agents)
+            ]
 
             for i in range(env.num_agents):
                 agents[i].update(states[i], actions[i], rewards[i], next_states[i])
@@ -162,14 +170,17 @@ def test(env, agents, episodes=1000, max_steps=200):
         agent.epsilon = 0  # greedy policy
 
     for ep in range(episodes):
-        states = env.reset()
+        pos = env.reset()
         steps = 0
         episode_collisions = 0
 
         for step in range(max_steps):
-            actions = [np.argmax(agent.q_table[tuple(states[i])]) for i, agent in enumerate(agents)]
+            actions = []
+            for i, agent in enumerate(agents):
+                st = agent.get_state(pos[i], env.goal_positions[i])
+                actions.append(int(np.argmax(agent.q_table[st])))
 
-            states, _, done, collisions = env.step(actions)
+            pos, _, done, collisions = env.step(actions)
             episode_collisions += collisions
             steps += 1
 
@@ -203,8 +214,8 @@ def run_experiments(maps):
             env = MultiUAVEnv(grid, num_agents)
             agents = [QAgent(len(ACTIONS)) for _ in range(num_agents)]
 
-            train(env, agents, episodes=5000)
-            avg_steps, collision_freq, success_rate = test(env, agents)
+            train(env, agents, episodes=TRAIN_EPISODES)
+            avg_steps, collision_freq, success_rate = test(env, agents, episodes=TEST_EPISODES)
 
             result = {
                 "Map": idx + 1,

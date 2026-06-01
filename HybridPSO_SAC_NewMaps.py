@@ -8,10 +8,10 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
-# Set QUICK_EXPERIMENT=1 for shorter training so results CSVs finish in much less time (same schema).
+# Set QUICK_EXPERIMENT=1 for shorter training (same schema; full runs are more accurate).
 _QUICK = os.environ.get("QUICK_EXPERIMENT", "").lower() in ("1", "true", "yes")
-TRAIN_EPISODES = 40 if _QUICK else 5000
-TEST_EPISODES = 20 if _QUICK else 1000
+TRAIN_EPISODES = 400 if _QUICK else 8000
+TEST_EPISODES = 100 if _QUICK else 1500
 
 # ==============================
 # ENVIRONMENT
@@ -47,50 +47,46 @@ class MultiUAVEnv:
         return 0<=x<self.n and 0<=y<self.n and self.grid[x,y]==0
 
     def step(self, actions):
-        new_positions=[]
-        rewards=[0]*self.num_agents
-        done=[False]*self.num_agents
-        collision_count=0
+        new_positions = []
+        rewards = [0.0] * self.num_agents
+        done = [False] * self.num_agents
+        collision_count = 0
 
-        for i,action in enumerate(actions):
-            dx,dy = ACTION_MAP[action]
-            x,y = self.positions[i]
-            new_pos=(x+dx,y+dy)
-
-            goal = self.goal_positions[i]
+        for i, action in enumerate(actions):
+            dx, dy = ACTION_MAP[action]
+            x, y = self.positions[i]
+            g = self.goal_positions[i]
+            d_old = abs(x - g[0]) + abs(y - g[1])
+            new_pos = (x + dx, y + dy)
 
             if not self.is_valid(new_pos):
-                rewards[i] -= 100
-                new_pos=self.positions[i]
+                rewards[i] -= 8.0
+                new_pos = self.positions[i]
             else:
-                rewards[i] -= 1
+                rewards[i] -= 0.2
 
-            # Distance-based shaping
-            dist = abs(new_pos[0]-goal[0]) + abs(new_pos[1]-goal[1])
-            rewards[i] -= 0.5 * dist
-
+            d_new = abs(new_pos[0] - g[0]) + abs(new_pos[1] - g[1])
+            rewards[i] += 0.9 * (d_old - d_new)
             new_positions.append(new_pos)
 
-        # Inter-agent collisions
         for i in range(self.num_agents):
-            for j in range(i+1,self.num_agents):
-                if new_positions[i]==new_positions[j]:
-                    rewards[i]-=50
-                    rewards[j]-=50
-                    collision_count+=1
-
-                if new_positions[i]==self.positions[j] and new_positions[j]==self.positions[i]:
-                    rewards[i]-=50
-                    rewards[j]-=50
-                    collision_count+=1
+            for j in range(i + 1, self.num_agents):
+                if new_positions[i] == new_positions[j]:
+                    rewards[i] -= 30.0
+                    rewards[j] -= 30.0
+                    collision_count += 1
+                if new_positions[i] == self.positions[j] and new_positions[j] == self.positions[i]:
+                    rewards[i] -= 20.0
+                    rewards[j] -= 20.0
+                    collision_count += 1
 
         for i in range(self.num_agents):
-            if new_positions[i]==self.goal_positions[i]:
-                rewards[i]+=200
-                done[i]=True
+            if new_positions[i] == self.goal_positions[i]:
+                rewards[i] += 120.0
+                done[i] = True
 
-        self.positions=new_positions
-        return new_positions,rewards,done,collision_count
+        self.positions = new_positions
+        return new_positions, rewards, done, collision_count
 
 
 # ==============================
@@ -144,9 +140,12 @@ class PSOOptimizer:
         personal_best = particles.copy()
         global_best = particles[0]
 
+        # One actor forward per PSO call; fitness is linear in p for fixed policy logits.
+        with torch.no_grad():
+            probs = actor(torch.as_tensor(state, dtype=torch.float32)).cpu().numpy()
+
         def fitness(p):
-            probs = actor(torch.FloatTensor(state)).detach().numpy()
-            return np.dot(p, probs)
+            return float(np.dot(p, probs))
 
         for _ in range(5):
             for i in range(self.num_particles):
@@ -181,25 +180,30 @@ class HybridAgent:
         self.q1_target.load_state_dict(self.q1.state_dict())
         self.q2_target.load_state_dict(self.q2.state_dict())
 
-        self.actor_opt = optim.Adam(self.actor.parameters(), lr=0.001)
-        self.q1_opt = optim.Adam(self.q1.parameters(), lr=0.001)
-        self.q2_opt = optim.Adam(self.q2.parameters(), lr=0.001)
+        self.actor_opt = optim.Adam(self.actor.parameters(), lr=2e-4)
+        self.q1_opt = optim.Adam(self.q1.parameters(), lr=2e-4)
+        self.q2_opt = optim.Adam(self.q2.parameters(), lr=2e-4)
 
-        self.memory = deque(maxlen=10000)
+        self.memory = deque(maxlen=20000)
         self.gamma = 0.99
-        self.alpha = 0.2
+        self.alpha = 0.1
         self.batch_size = 64
 
         self.pso = PSOOptimizer(action_dim)
 
-    def get_state(self, pos):
-        return np.array(pos, dtype=np.float32)
+    def get_state(self, pos, goal, n):
+        x, y = pos
+        gx, gy = goal
+        return np.array(
+            [x / n, y / n, (gx - x) / n, (gy - y) / n],
+            dtype=np.float32
+        )
 
     def choose_action(self, state):
-        state_t = torch.FloatTensor(state)
-
-        probs = self.actor(state_t).detach().numpy()
-        sac_action = np.random.choice(len(probs), p=probs)
+        with torch.no_grad():
+            state_t = torch.as_tensor(state, dtype=torch.float32)
+            probs = self.actor(state_t).cpu().numpy()
+        sac_action = int(np.random.choice(len(probs), p=probs))
 
         pso_action = self.pso.optimize(state, self.actor)
 
@@ -219,8 +223,8 @@ class HybridAgent:
         batch = random.sample(self.memory, self.batch_size)
         s,a,r,s_next,d = zip(*batch)
 
-        s = torch.FloatTensor(s)
-        s_next = torch.FloatTensor(s_next)
+        s = torch.as_tensor(np.stack(s), dtype=torch.float32)
+        s_next = torch.as_tensor(np.stack(s_next), dtype=torch.float32)
         a = torch.LongTensor(a)
         r = torch.FloatTensor(r)
         d = torch.FloatTensor(d)
@@ -253,8 +257,10 @@ class HybridAgent:
         probs = self.actor(s)
         log_probs = torch.log(probs + 1e-8)
 
-        q_vals = torch.min(self.q1(s), self.q2(s))
-        actor_loss = (probs * (self.alpha*log_probs - q_vals)).sum(dim=1).mean()
+        q1_all = self.q1(s)
+        q2_all = self.q2(s)
+        q_vals = torch.min(q1_all, q2_all)
+        actor_loss = (probs * (self.alpha * log_probs - q_vals)).sum(dim=1).mean()
 
         self.actor_opt.zero_grad()
         actor_loss.backward()
@@ -273,18 +279,13 @@ class HybridAgent:
 # ==============================
 
 def train(env, agents, episodes=5000):
+    max_steps = 250
 
     for ep in range(episodes):
-
-        if ep < 1000:
-            max_steps = 100
-        elif ep < 3000:
-            max_steps = 150
-        else:
-            max_steps = 200
-
-        states = env.reset()
-        states = [agents[i].get_state(states[i]) for i in range(env.num_agents)]
+        pos = env.reset()
+        states = [
+            agents[i].get_state(pos[i], env.goal_positions[i], env.n) for i in range(env.num_agents)
+        ]
 
         steps = 0
         collisions = 0
@@ -292,21 +293,26 @@ def train(env, agents, episodes=5000):
         for _ in range(max_steps):
             actions = [agents[i].choose_action(states[i]) for i in range(env.num_agents)]
 
-            next_states, rewards, done, c = env.step(actions)
-            next_states = [agents[i].get_state(next_states[i]) for i in range(env.num_agents)]
+            next_pos, rewards, done, c = env.step(actions)
+            next_states = [
+                agents[i].get_state(next_pos[i], env.goal_positions[i], env.n) for i in range(env.num_agents)
+            ]
 
             for i in range(env.num_agents):
-                agents[i].store(states[i], actions[i], rewards[i], next_states[i], done[i])
+                agents[i].store(
+                    states[i], actions[i], rewards[i], next_states[i], float(done[i])
+                )
                 agents[i].train_step()
 
             states = next_states
+            pos = next_pos
             steps += 1
             collisions += c
 
             if all(done):
                 break
 
-        if (ep+1) % 100 == 0:
+        if (ep + 1) % 100 == 0:
             print(f"Episode {ep+1} | Steps:{steps} | Collisions:{collisions}")
 
 
@@ -318,17 +324,18 @@ def test(env, agents, episodes=1000):
     total_steps, total_collisions, success = 0,0,0
 
     for _ in range(episodes):
-        states = env.reset()
-        steps,collisions = 0,0
+        pos = env.reset()
+        steps, collisions = 0, 0
 
         for _ in range(200):
-            actions=[]
-            for i,a in enumerate(agents):
-                s = torch.FloatTensor(a.get_state(states[i]))
-                probs = a.actor(s).detach().numpy()
-                actions.append(np.argmax(probs))
+            actions = []
+            for i, a in enumerate(agents):
+                s = a.get_state(pos[i], env.goal_positions[i], env.n)
+                with torch.no_grad():
+                    probs = a.actor(torch.as_tensor(s, dtype=torch.float32)).cpu().numpy()
+                actions.append(int(np.argmax(probs)))
 
-            states,_,done,c = env.step(actions)
+            pos, _, done, c = env.step(actions)
             collisions += c
             steps += 1
 
@@ -356,7 +363,7 @@ def run_experiments(maps):
             print(f"Agents: {num_agents}")
 
             env = MultiUAVEnv(grid, num_agents)
-            agents = [HybridAgent(2,5) for _ in range(num_agents)]
+            agents = [HybridAgent(4, 5) for _ in range(num_agents)]
 
             train(env, agents, episodes=TRAIN_EPISODES)
             avg_steps, col_freq, suc_rate = test(env, agents, episodes=TEST_EPISODES)
